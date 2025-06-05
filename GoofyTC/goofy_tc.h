@@ -1,4 +1,4 @@
-// goofy_tc.h v1.0
+﻿// goofy_tc.h v1.0
 // Realtime BC1/ETC1 encoder by Sergey Makeev <sergeymakeev@hotmail.com>
 // 
 // LICENSE:
@@ -6,11 +6,7 @@
 
 #include <cassert>
 #include <cstdint>
-
-namespace goofy {
-int compressDXT1(unsigned char* result, const unsigned char* input, unsigned int width, unsigned int height, unsigned int stride);
-int compressETC1(unsigned char* result, const unsigned char* input, unsigned int width, unsigned int height, unsigned int stride);
-} // namespace goofy
+#include <functional>
 
 // Enable SSE2 codec
 #define GOOFY_SSE2 (1)
@@ -175,6 +171,11 @@ namespace simd
     goofy_inline uint8x16_t fetch(const void* p)
     {
         return _mm_load_si128((const __m128i*)p);
+    }
+
+    goofy_inline uint8x16_t fetchu(const void* p)
+    {
+        return _mm_loadu_si128((const __m128i*)p);
     }
 
     goofy_inline uint64x2_t getAsUInt64x2(const uint8x16_t& a)
@@ -1062,15 +1063,12 @@ enum GoofyCodecType
     GOOFY_DXT1,
     GOOFY_ETC1,
 };
-
 //
 // Encode 4 DXT1/ETC1 at once
 //
-template<GoofyCodecType CODEC_TYPE>
-goofy_inline void goofySimdEncode(const unsigned char* goofy_restrict inputRGBA, size_t inputStride, unsigned char* goofy_restrict pResult)
+template<typename BlockLoader, GoofyCodecType CODEC_TYPE>
+goofy_inline void goofySimdEncode(BlockLoader& blockLoader, unsigned char* goofy_restrict pResult)
 {
-    assert(uintptr_t(inputRGBA) % 64 == 0); // make sure the input is 64 bit aligned.
-
     // Fetch 16x4 pixels from the buffer(four DX blocks)
     // 16 pixels wide is better for the CPU cache utilization (64 bytes per line) and it is better for SIMD lane utilization
     // -----------------------------------------------------------
@@ -1078,25 +1076,7 @@ goofy_inline void goofySimdEncode(const unsigned char* goofy_restrict inputRGBA,
     uint8x16x4_t bl1;
     uint8x16x4_t bl2;
     uint8x16x4_t bl3;
-    bl0.r0 = simd::fetch(inputRGBA);
-    bl1.r0 = simd::fetch(inputRGBA + 16);
-    bl2.r0 = simd::fetch(inputRGBA + 32);
-    bl3.r0 = simd::fetch(inputRGBA + 48);
-    inputRGBA += inputStride;
-    bl0.r1 = simd::fetch(inputRGBA);
-    bl1.r1 = simd::fetch(inputRGBA + 16);
-    bl2.r1 = simd::fetch(inputRGBA + 32);
-    bl3.r1 = simd::fetch(inputRGBA + 48);
-    inputRGBA += inputStride;
-    bl0.r2 = simd::fetch(inputRGBA);
-    bl1.r2 = simd::fetch(inputRGBA + 16);
-    bl2.r2 = simd::fetch(inputRGBA + 32);
-    bl3.r2 = simd::fetch(inputRGBA + 48);
-    inputRGBA += inputStride;
-    bl0.r3 = simd::fetch(inputRGBA);
-    bl1.r3 = simd::fetch(inputRGBA + 16);
-    bl2.r3 = simd::fetch(inputRGBA + 32);
-    bl3.r3 = simd::fetch(inputRGBA + 48);
+    blockLoader.LoadRGBA(bl0, bl1, bl2, bl3);
 
     // Find min block colors
     // -----------------------------------------------------------
@@ -1427,13 +1407,13 @@ goofy_inline void goofySimdEncode(const unsigned char* goofy_restrict inputRGBA,
         // avg0.bb | avg1.bb | avg2.bb | avg3.bb | avg0.bb | avg1.bb | avg2.bb | avg3.bb
         const uint8x16x3_t blAvg4Di = simd::deinterleaveRGB(blAvg4);
 
-        // Y = avg0.yy | avg1.yy | avg2.yy | avg3.yy | avg0.yy | avg1.yy | avg2.yy | avg3.yy
-        const uint8x16_t Y = simd::avg(simd::avg(blAvg4Di.r0, blAvg4Di.r2), blAvg4Di.r1);
+        // Y2 = avg0.yy | avg1.yy | avg2.yy | avg3.yy | avg0.yy | avg1.yy | avg2.yy | avg3.yy
+        const uint8x16_t Y2 = simd::avg(simd::avg(blAvg4Di.r0, blAvg4Di.r2), blAvg4Di.r1);
 
         // Min/max brightness per block
         // R0 = avg0.yyyy | avg1.yyyy | avg2.yyyy | avg3.yyyy
         // R1 = avg0.yyyy | avg1.yyyy | avg2.yyyy | avg3.yyyy    // NOTE: not used!
-        const uint8x16x2_t blAvgY = simd::zipB16(Y, Y);
+        const uint8x16x2_t blAvgY = simd::zipB16(Y2, Y2);
 
         const uint8x16_t blPosCorrectionY = simd::minu(simd::subsatu(blMidY, blAvgY.r0), constMaxInt);
         const uint8x16_t blNegCorrectionY = simd::minu(simd::subsatu(blAvgY.r0, blMidY), constMaxInt);
@@ -1494,67 +1474,234 @@ goofy_inline void goofySimdEncode(const unsigned char* goofy_restrict inputRGBA,
 }
 
 
+
+struct RGBA8BlockLoader {
+    enum {
+        PixelStep = 4,
+        BlockStep = PixelStep * 4,
+        BlockStep_1 = BlockStep,
+        BlockStep_2 = BlockStep * 2,
+        BlockStep_3 = BlockStep * 3,
+        BlockStep_4 = BlockStep * 4,
+        EncodeStep = BlockStep * 4,
+    };
+    static inline void LoadPixel(uint8x16_t& out, const unsigned char* goofy_restrict inputRGB) {
+        out.m128i_i8[0] = inputRGB[0];
+        out.m128i_i8[1] = inputRGB[1];
+        out.m128i_i8[2] = inputRGB[2];
+        out.m128i_i8[3] = inputRGB[3];
+
+        out.m128i_i8[4] = inputRGB[4];
+        out.m128i_i8[5] = inputRGB[5];
+        out.m128i_i8[6] = inputRGB[6];
+        out.m128i_i8[7] = inputRGB[7];
+
+        out.m128i_i8[8] = inputRGB[8];
+        out.m128i_i8[9] = inputRGB[9];
+        out.m128i_i8[10] = inputRGB[10];
+        out.m128i_i8[11] = inputRGB[11];
+
+        out.m128i_i8[12] = inputRGB[12];
+        out.m128i_i8[13] = inputRGB[13];
+        out.m128i_i8[14] = inputRGB[14];
+        out.m128i_i8[15] = inputRGB[15];
+    }
+
+    void LoadRGBA(uint8x16x4_t& bl0, uint8x16x4_t& bl1, uint8x16x4_t& bl2, uint8x16x4_t& bl3) {
+        //bl0.r0 = simd::fetchu(inputData);
+        //bl1.r0 = simd::fetchu(inputData + 16);
+        //bl2.r0 = simd::fetchu(inputData + 32);
+        //bl3.r0 = simd::fetchu(inputData + 48);
+        //inputData += inputStride;
+        //bl0.r1 = simd::fetchu(inputData);
+        //bl1.r1 = simd::fetchu(inputData + 16);
+        //bl2.r1 = simd::fetchu(inputData + 32);
+        //bl3.r1 = simd::fetchu(inputData + 48);
+        //inputData += inputStride;
+        //bl0.r2 = simd::fetchu(inputData);
+        //bl1.r2 = simd::fetchu(inputData + 16);
+        //bl2.r2 = simd::fetchu(inputData + 32);
+        //bl3.r2 = simd::fetchu(inputData + 48);
+        //inputData += inputStride;
+        //bl0.r3 = simd::fetchu(inputData);
+        //bl1.r3 = simd::fetchu(inputData + 16);
+        //bl2.r3 = simd::fetchu(inputData + 32);
+        //bl3.r3 = simd::fetchu(inputData + 48);
+        LoadPixel(bl0.r0, inputData);
+        LoadPixel(bl1.r0, inputData + BlockStep_1);
+        LoadPixel(bl2.r0, inputData + BlockStep_2);
+        LoadPixel(bl3.r0, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r1, inputData);
+        LoadPixel(bl1.r1, inputData + BlockStep_1);
+        LoadPixel(bl2.r1, inputData + BlockStep_2);
+        LoadPixel(bl3.r1, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r2, inputData);
+        LoadPixel(bl1.r2, inputData + BlockStep_1);
+        LoadPixel(bl2.r2, inputData + BlockStep_2);
+        LoadPixel(bl3.r2, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r3, inputData);
+        LoadPixel(bl1.r3, inputData + BlockStep_1);
+        LoadPixel(bl2.r3, inputData + BlockStep_2);
+        LoadPixel(bl3.r3, inputData + BlockStep_3);
+    }
+public:
+    const unsigned int pixelSize = 4;
+    const unsigned int encodeStep = 64;
+    const unsigned char* goofy_restrict inputData = nullptr;
+    size_t inputStride = 0;
+};
+
+
+struct BGR8BlockLoader {
+    enum {
+        PixelStep = 3,
+        BlockStep = PixelStep * 4,
+        BlockStep_1 = BlockStep,
+        BlockStep_2 = BlockStep * 2,
+        BlockStep_3 = BlockStep * 3,
+        BlockStep_4 = BlockStep * 4,
+        EncodeStep = BlockStep * 4,
+    };
+    static inline void LoadPixel(uint8x16_t& out, const unsigned char* goofy_restrict inputRGB) {
+        out.m128i_i8[0] = inputRGB[2]; out.m128i_i8[1] = inputRGB[1]; out.m128i_i8[2] = inputRGB[0]; out.m128i_i8[3] = -1;
+        out.m128i_i8[4] = inputRGB[5]; out.m128i_i8[5] = inputRGB[4]; out.m128i_i8[6] = inputRGB[3]; out.m128i_i8[7] = -1;
+        out.m128i_i8[8] = inputRGB[8]; out.m128i_i8[9] = inputRGB[7]; out.m128i_i8[10] = inputRGB[6]; out.m128i_i8[11] = -1;
+        out.m128i_i8[12] = inputRGB[11]; out.m128i_i8[13] = inputRGB[10]; out.m128i_i8[14] = inputRGB[9]; out.m128i_i8[15] = -1;
+    }
+
+    void LoadRGBA(uint8x16x4_t& bl0, uint8x16x4_t& bl1, uint8x16x4_t& bl2, uint8x16x4_t& bl3) {
+        LoadPixel(bl0.r0, inputData);
+        LoadPixel(bl1.r0, inputData + BlockStep_1);
+        LoadPixel(bl2.r0, inputData + BlockStep_2);
+        LoadPixel(bl3.r0, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r1, inputData);
+        LoadPixel(bl1.r1, inputData + BlockStep_1);
+        LoadPixel(bl2.r1, inputData + BlockStep_2);
+        LoadPixel(bl3.r1, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r2, inputData);
+        LoadPixel(bl1.r2, inputData + BlockStep_1);
+        LoadPixel(bl2.r2, inputData + BlockStep_2);
+        LoadPixel(bl3.r2, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r3, inputData);
+        LoadPixel(bl1.r3, inputData + BlockStep_1);
+        LoadPixel(bl2.r3, inputData + BlockStep_2);
+        LoadPixel(bl3.r3, inputData + BlockStep_3);
+    }
+public:
+    const unsigned char* goofy_restrict inputData = nullptr;
+    size_t inputStride = 0;
+};
+
+struct RGB8BlockLoader {
+    enum {
+        PixelStep = 3,
+        BlockStep = PixelStep * 4,
+        BlockStep_1 = BlockStep,
+        BlockStep_2 = BlockStep * 2,
+        BlockStep_3 = BlockStep * 3,
+        BlockStep_4 = BlockStep * 4,
+        EncodeStep = BlockStep * 4,
+    };
+    static inline void LoadPixel(uint8x16_t& out, const unsigned char* goofy_restrict inputRGB) {
+        out.m128i_i8[0] = inputRGB[0]; out.m128i_i8[1] = inputRGB[1]; out.m128i_i8[2] = inputRGB[2]; out.m128i_i8[3] = -1;
+        out.m128i_i8[4] = inputRGB[3]; out.m128i_i8[5] = inputRGB[4]; out.m128i_i8[6] = inputRGB[5]; out.m128i_i8[7] = -1;
+        out.m128i_i8[8] = inputRGB[6]; out.m128i_i8[9] = inputRGB[7]; out.m128i_i8[10] = inputRGB[8]; out.m128i_i8[11] = -1;
+        out.m128i_i8[12] = inputRGB[9]; out.m128i_i8[13] = inputRGB[10]; out.m128i_i8[14] = inputRGB[11]; out.m128i_i8[15] = -1;
+    }
+
+    void LoadRGBA(uint8x16x4_t& bl0, uint8x16x4_t& bl1, uint8x16x4_t& bl2, uint8x16x4_t& bl3) {
+        LoadPixel(bl0.r0, inputData);
+        LoadPixel(bl1.r0, inputData + BlockStep_1);
+        LoadPixel(bl2.r0, inputData + BlockStep_2);
+        LoadPixel(bl3.r0, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r1, inputData);
+        LoadPixel(bl1.r1, inputData + BlockStep_1);
+        LoadPixel(bl2.r1, inputData + BlockStep_2);
+        LoadPixel(bl3.r1, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r2, inputData);
+        LoadPixel(bl1.r2, inputData + BlockStep_1);
+        LoadPixel(bl2.r2, inputData + BlockStep_2);
+        LoadPixel(bl3.r2, inputData + BlockStep_3);
+        inputData += inputStride;
+        LoadPixel(bl0.r3, inputData);
+        LoadPixel(bl1.r3, inputData + BlockStep_1);
+        LoadPixel(bl2.r3, inputData + BlockStep_2);
+        LoadPixel(bl3.r3, inputData + BlockStep_3);
+    }
+public:
+    const unsigned char* goofy_restrict inputData = nullptr;
+    size_t inputStride = 0;
+};
+
+template<typename BlockLoader>
 int compressDXT1(unsigned char* result, const unsigned char* input, unsigned int width, unsigned int height, unsigned int stride)
 {
     // those checks are required because of 4x1 block window inside the compressor
-    if (width % 16 != 0)
-    {
+    if (width % 16 != 0) {
         return -1;
     }
 
-    if (height % 4 != 0)
-    {
+    if (height % 4 != 0) {
         return -2;
     }
 
     unsigned int blockW = width >> 2;
     unsigned int blockH = height >> 2;
-
-    size_t inputStride = stride;
+    BlockLoader blockLoader;
+    blockLoader.inputStride = stride;
     for (uint32_t y = 0; y < blockH; y++)
     {
         const unsigned char* goofy_restrict encoderPos = input;
         for (uint32_t x = 0; x < blockW; x += 4)
         {
-            goofySimdEncode<GOOFY_DXT1>(encoderPos, inputStride, result);
-            encoderPos += 64; // 16 rgba pixels (4 DXT blocks) = 16 * 4 = 64
+            blockLoader.inputData = encoderPos;
+            goofySimdEncode<BlockLoader, GOOFY_DXT1>(blockLoader, result);
+            encoderPos += blockLoader.EncodeStep; // 16 rgba pixels (4 DXT blocks) = 16 * 4 = 64
             result += 32;     // 4 DXT1 blocks = 8 * 4 = 32
         }
-        input += inputStride * 4; // 4 lines
+        input += blockLoader.inputStride * 4; // 4 lines
     }
     return 0;
 }
 
-int compressETC1(unsigned char* result, const unsigned char* input, unsigned int width, unsigned int height, unsigned int stride)
-{
-    // those checks are required because of 4x1 block window inside the compressor
-    if (width % 16 != 0)
-    {
-        return -1;
-    }
-
-    if (height % 4 != 0)
-    {
-        return -2;
-    }
-
-    unsigned int blockW = width >> 2;
-    unsigned int blockH = height >> 2;
-
-    size_t inputStride = stride;
-    for (uint32_t y = 0; y < blockH; y++)
-    {
-        const unsigned char* goofy_restrict encoderPos = input;
-        for (uint32_t x = 0; x < blockW; x += 4)
-        {
-            goofySimdEncode<GOOFY_ETC1>(encoderPos, inputStride, result);
-            encoderPos += 64; // 16 rgba pixels (4 DXT blocks) = 16 * 4 = 64
-            result += 32;     // 4 DXT1 blocks = 8 * 4 = 32
-        }
-        input += inputStride * 4; // 4 lines
-    }
-    return 0;
-}
+//int compressETC1(unsigned char* result, const unsigned char* input, unsigned int width, unsigned int height, unsigned int stride)
+//{
+//    // those checks are required because of 4x1 block window inside the compressor
+//    if (width % 16 != 0)
+//    {
+//        return -1;
+//    }
+//
+//    if (height % 4 != 0)
+//    {
+//        return -2;
+//    }
+//
+//    unsigned int blockW = width >> 2;
+//    unsigned int blockH = height >> 2;
+//
+//    size_t inputStride = stride;
+//    for (uint32_t y = 0; y < blockH; y++)
+//    {
+//        const unsigned char* goofy_restrict encoderPos = input;
+//        for (uint32_t x = 0; x < blockW; x += 4)
+//        {
+//            goofySimdEncode<GOOFY_ETC1>(encoderPos, inputStride, result);
+//            encoderPos += 64; // 16 rgba pixels (4 DXT blocks) = 16 * 4 = 64
+//            result += 32;     // 4 DXT1 blocks = 8 * 4 = 32
+//        }
+//        input += inputStride * 4; // 4 lines
+//    }
+//    return 0;
+//}
 
 
 
